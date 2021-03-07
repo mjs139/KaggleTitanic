@@ -1,0 +1,359 @@
+---
+title: "Kaggle Titanic Competition"
+author: "Matthew Sahagun"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+### Introduction
+
+The Kaggle Titanic competition asks you to predict whether a passenger will survive or not based on a variety of explanatory variables, including sex, fare, etc. For the competition, I will practice using a variety of machine learning algorithms and then submit my result to Kaggle. Specifically, I plan on using
+
+0. Null Model
+1. kNN
+2. Boosted C5.0 
+3. Random Forest
+4. Logistic Regression using regularization
+
+### Data
+
+```{r, warning = FALSE, message = FALSE}
+library(pacman)
+p_load(titanic, tidyverse, janitor, naniar, DataExplorer, tidymodels, tidyr)
+```
+
+
+```{r}
+data(titanic_train)
+data(titanic_test)
+
+glimpse(titanic_train)
+glimpse(titanic_test)
+```
+First, I will filter the columns. I will remove PassengerId, Name, and Ticket as these are ID variable. I will also remove Cabin and Embarked as I don't believe that these will be useful. I will also change sex to a numeric (1 for female, 0 for male) to allow for KNN. 
+
+```{r}
+titanic_test_2 = titanic_test %>%
+   mutate(
+    Pclass = as_factor(Pclass)
+  ) %>%
+  mutate(Sex_num = ifelse(Sex == "male", 0, 1)) %>%
+  select(-c(PassengerId, Name, Ticket, Cabin, Embarked, Sex))
+
+colnames(titanic_test_2)
+
+titanic_train_2 = titanic_train %>%
+  mutate(
+    Survived = as_factor(Survived),
+    Pclass = as_factor(Pclass)
+  ) %>%
+  mutate(Sex_num = ifelse(Sex == "male", 0, 1)) %>%
+  select(-c(PassengerId, Name, Ticket, Cabin, Embarked, Sex))
+
+colnames(titanic_train_2)
+```
+
+I now want to take a look at na values. It would be helpful to know the percent of na's from each column. 
+```{r}
+round(colMeans(is.na(titanic_test_2)), 4)
+round(colMeans(is.na(titanic_train_2)), 4)
+```
+It looks like we have a single for fare, and many na's for age. I will imputate those values with the median for each column. 
+```{r}
+med_age = median(titanic_train_2$Age, na.rm = TRUE)
+med_fare = median(titanic_train_2$Fare, na.rm = TRUE)
+
+titanic_train_imp = titanic_train_2 %>%
+  group_by(Age) %>%
+  mutate(Age = replace_na(Age, med_age)) %>%
+  mutate(Fare = replace_na(Fare, med_fare))
+
+round(colMeans(is.na(titanic_train_imp)), 4)
+
+titanic_test_imp = titanic_test_2 %>%
+  group_by(Age) %>%
+  mutate(Age = replace_na(Age, med_age))  %>%
+  mutate(Fare = replace_na(Fare, med_fare))
+
+round(colMeans(is.na(titanic_test_imp)), 4)
+```
+
+Now, I will take the training data, and split it between test and training data (20-80 split). 
+```{r}
+set.seed(42)
+
+dat_parts <- titanic_train_imp %>%
+  initial_split(prop = 0.8)
+
+train <- dat_parts %>%
+  training()
+
+test <- dat_parts %>%
+  testing()
+```
+
+### Null Model
+
+To build the null model, I will need to see what percentage of people survived from my training data set. 
+```{r}
+train %>%
+  select(Survived) %>%
+  group_by(Survived) %>%
+  summarise(n=n(), ratio = n/nrow(train))
+```
+It looks like most people (61.6%) from the training set died on the Titanic. 
+
+I will now test the null model on the test dataset, and that will be my baseline for every other model's result. 
+
+```{r}
+test %>%
+  select(Survived) %>%
+  group_by(Survived) %>%
+  summarise(n=n(), ratio = n/nrow(test))
+```
+It looks like the null model correctly identifies 62.8% of the people in the test data set. 
+
+### Logistic Regression Model
+
+I will now create a logistic regression model. 
+```{r}
+model <- glm(Survived ~.,family=binomial(link='logit'),data=train)
+
+summary(model)
+```
+I will now rerun the model keeping only the statistically significant variables. 
+```{r}
+model2 <- glm(Survived ~ Pclass + Age + SibSp + Sex_num, family=binomial(link='logit'),data=train)
+
+summary(model2)
+```
+
+I will now test to see how the logistic model runs using the test data. 
+```{r}
+probs_test = predict(model2, newdata = test, type = "response")
+length(probs_test)
+
+preds_test = rep(0, 178)
+preds_test[probs_test > 0.5] = 1
+head(probs_test)
+head(preds_test)
+```
+
+Now I will make the confusion matrix
+```{r}
+tb = table(prediction = preds_test,
+           actual = test$Survived)
+addmargins(tb)
+
+141/178
+```
+The logistic model performed better than the null model. It correctly identified 79.2% of the passengers. 
+
+\newpage
+### KNN Model
+
+I will create a KNN model. For KNN, all predictors need to be numeric. 
+```{r}
+titanic_train_imp_knn = titanic_train_imp %>% 
+  mutate(Pclass = as.numeric(Pclass))
+
+set.seed(42)
+
+dat_parts_knn <- titanic_train_imp_knn %>%
+  initial_split(prop = 0.8)
+
+train_knn <- dat_parts_knn %>%
+  training()
+
+test_knn <- dat_parts_knn %>%
+  testing()
+```
+
+
+```{r}
+tit_rec <-
+  recipe(Survived ~ ., data = train_knn) %>%
+  step_normalize(all_predictors()) %>% 
+  prep()
+
+tit_rec
+summary(tit_rec)
+```
+
+tune function allows you to not have to specify the number of neighbors. tune sets up a tuning grid
+```{r}
+tune_spec <- 
+  nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>% 
+  set_mode("classification")
+```
+
+```{r}
+tune_grid <- seq(5, 23, by = 2)
+tune_grid
+```
+
+```{r}
+tit_wflow <-
+  workflow() %>%
+  add_recipe(tit_rec) %>%
+  add_model(tune_spec)
+
+tit_wflow
+```
+Using Cross Validation, 5 folds
+
+```{r}
+folds <- vfold_cv(train_knn, v = 5)
+folds
+```
+
+```{r, warning = FALSE, message = FALSE}
+tit_fit_rs <- 
+  tit_wflow %>% 
+  tune_grid(
+    resamples = folds,
+    grid = tune_grid
+    )
+```
+
+```{r}
+collect_metrics(tit_fit_rs)
+```
+Showing which model had the best accuracy
+```{r}
+tit_fit_rs %>%
+  show_best("accuracy")
+```
+
+```{r}
+best_knn <- tit_fit_rs %>%
+  select_best("accuracy")
+
+best_knn
+```
+
+```{r}
+final_wflow <- 
+  tit_wflow %>% 
+  finalize_workflow(best_knn)
+```
+
+```{r}
+final_knn <- 
+  final_wflow %>%
+  last_fit(dat_parts_knn) 
+
+final_knn %>% 
+    collect_metrics()
+
+```
+The KNN model correctly identified the correct response 82.6% of the time, performing much better than either the logistic or null models.
+
+\newpage
+###  Decision Tree
+
+I will now run a C5.0 model. 
+
+Build the simplest decision tree
+
+```{r, warning = FALSE, message = FALSE}
+library(C50)
+tit5_model <- C5.0(Survived ~ ., data = train, trials = 1) 
+```
+
+Display simple facts about the tree
+```{r}
+tit5_model
+```
+
+Display detailed information about the tree
+
+```{r}
+summary(tit5_model)
+#this also provides error for training data. IN this case, it is 18%
+```
+I will now evaluate the performance of the C5.0 model. 
+
+```{r}
+tit5_pred <- predict(tit5_model, test, type="class")
+sum(tit5_pred == test$Survived ) / length(tit5_pred)
+```
+
+Cross tabulation of predicted versus actual classes
+
+```{r}
+library(gmodels)
+CrossTable(test$Survived, tit5_pred,
+           prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+           dnn = c('actual', 'predicted'))
+```
+The C5.0 Decision Tree model correctly predicted 82.0% of the passengers on the training set. This is better than the null model. 
+
+\newpage
+###  Boosted C5.0 Decision Tree
+
+I will now try to improve on this using boosting. 
+
+```{r}
+tit5_boost10 <- C5.0(Survived ~ ., data = train,
+                       trials = 10) #build 10 trees
+tit5_boost10
+summary(tit5_boost10)
+```
+
+```{r}
+tit5_boost_pred10 <- predict(tit5_boost10, test)
+CrossTable(test$Survived, tit5_boost_pred10,
+           prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+           dnn = c('actual', 'predicted'))
+```
+The boosted tree correctly identified 82.6% of the passengers on the training set. While better than the null model, the boosted decision tree is only slightly better than the original tree. 
+
+\newpage
+### Random Forest
+
+I will now build a random forest model with the data
+
+```{r}
+library(ranger)
+
+## Random Forests ----
+
+set.seed(42)
+rf <- ranger(Survived ~ ., data = train, num.threads = 2)
+rf
+
+rf$confusion.matrix
+```
+```{r}
+p2 <- predict(rf, test, type="response" )
+sum(p2$predictions == test$Survived ) / length( p2$predictions )
+```
+The decision tree correctly classified 82.0% of the test data. 
+
+### Conclusion
+
+The KNN and boosted decision tree models outperformed the others, correctly identifying 82.6% and 82.4% of the passengers. 
+
+### Kaggle Final Model
+
+For the Kaggle competition, I will choose to upload results for the boosted decision tree models. 
+
+```{r}
+pred_tree_final = predict(tit5_boost10, titanic_test_2)
+```
+```{r}
+final_df = data.frame("PassengerID" = titanic_test$PassengerId, "Survived" = pred_tree_final)
+head(final_df)
+```
+```{r}
+#write.csv(final_df,"sahagun_matthew_titanic_kaggle.csv", row.names = FALSE)
+```
+
+When I submitted the file to Kaggle, I was informed that I correctly identified 77.5% of the passengers. 
+
+
+
